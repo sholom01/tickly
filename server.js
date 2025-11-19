@@ -106,79 +106,119 @@ app.command('/tickly', async ({ command, ack, respond }) => {
   await sendActionMenu(respond);
 });
 
-/**
- * Start tracking: create a new time entry with the current timestamp and mark it
- * as active. If there’s already an active entry, notify the user instead of
- * creating another one.
- */
+// =========================
+// START TRACKING (updated)
+// =========================
 app.action('start_tracking', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
   const channelId = body.channel.id;
-  // Check if the user already has an active entry
+
+  // Check if there is already an active entry
   const { data: active, error } = await supabase
     .from('time_entries')
     .select('*')
     .eq('user_id', userId)
     .eq('is_active', true)
     .limit(1);
-  if (error) {
-    await client.chat.postMessage({ channel: channelId, text: `Error checking active timer: ${error.message}` });
-    return;
-  }
+
   if (active && active.length > 0) {
-    await client.chat.postMessage({ channel: channelId, text: 'You already have an active timer. Stop it before starting a new one.' });
+    await client.chat.postMessage({
+      channel: channelId,
+      text: '⏱ You already have an active timer.'
+    });
     return;
   }
+
   const startTime = new Date().toISOString();
-  const { error: insertError } = await supabase.from('time_entries').insert({
+
+  // Send initial message in the channel
+  const message = await client.chat.postMessage({
+    channel: channelId,
+    text: `⏱ <@${userId}> started a timer.`,
+    blocks: [
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: `⏱ <@${userId}> started a timer\n*Elapsed:* 0 minutes` }
+      }
+    ]
+  });
+
+  const message_ts = message.ts;
+
+  // Insert new time entry including message_ts + message_channel
+  await supabase.from('time_entries').insert({
     user_id: userId,
     channel_id: channelId,
     start_time: startTime,
-    is_active: true
+    is_active: true,
+    message_ts: message_ts,
+    message_channel: channelId
   });
-  if (insertError) {
-    await client.chat.postMessage({ channel: channelId, text: `Error starting timer: ${insertError.message}` });
-  } else {
-    await client.chat.postMessage({ channel: channelId, text: 'Started tracking your time.' });
-  }
+
+  await client.chat.postMessage({
+    channel: channelId,
+    text: 'Tracking started!'
+  });
 });
 
-/**
- * Stop tracking: find the current active entry, set its end time, calculate the
- * duration, and mark it inactive. If there is no active entry, notify the user.
- */
+
+// =========================
+// STOP TRACKING (updated)
+// =========================
 app.action('stop_tracking', async ({ ack, body, client }) => {
   await ack();
   const userId = body.user.id;
-  const channelId = body.channel.id;
+
   const { data: active, error } = await supabase
     .from('time_entries')
     .select('*')
     .eq('user_id', userId)
     .eq('is_active', true)
     .limit(1);
-  if (error) {
-    await client.chat.postMessage({ channel: channelId, text: `Error fetching active timer: ${error.message}` });
-    return;
-  }
+
   if (!active || active.length === 0) {
-    await client.chat.postMessage({ channel: channelId, text: 'No active timer found.' });
+    await client.chat.postMessage({
+      channel: body.channel.id,
+      text: 'No active timer to stop.'
+    });
     return;
   }
+
   const entry = active[0];
   const endTime = new Date().toISOString();
   const durationSeconds = Math.floor((new Date(endTime) - new Date(entry.start_time)) / 1000);
-  const { error: updateError } = await supabase
+  const minutes = Math.floor(durationSeconds / 60);
+
+  // Mark entry inactive
+  await supabase
     .from('time_entries')
-    .update({ end_time: endTime, duration: durationSeconds, is_active: false })
+    .update({
+      end_time: endTime,
+      duration: durationSeconds,
+      is_active: false
+    })
     .eq('id', entry.id);
-  if (updateError) {
-    await client.chat.postMessage({ channel: channelId, text: `Error stopping timer: ${updateError.message}` });
-  } else {
-    await client.chat.postMessage({ channel: channelId, text: 'Stopped tracking your time.' });
-  }
+
+  // Update the original message
+  await client.chat.update({
+    channel: entry.message_channel,
+    ts: entry.message_ts,
+    text: `✔️ Timer stopped for <@${userId}>`,
+    blocks: [
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: `✔️ <@${userId}> stopped the timer\n*Total:* ${minutes} minutes` }
+      }
+    ]
+  });
+
+  await client.chat.postMessage({
+    channel: entry.message_channel,
+    text: `Timer stopped — ${minutes} minutes tracked`
+  });
 });
+
 
 /**
  * Add a note: open a modal where the user can type a note or title. When the
@@ -399,3 +439,41 @@ receiver.router.post('/slack/events', (req, res) => {
     return res.status(200).send(challenge);
   }
 });
+
+// =========================
+// UPDATE ACTIVE TIMERS EVERY MINUTE
+// =========================
+setInterval(async () => {
+  const now = new Date();
+
+  // Get all active timers
+  const { data: activeTimers } = await supabase
+    .from('time_entries')
+    .select('*')
+    .eq('is_active', true);
+
+  if (!activeTimers) return;
+
+  for (const entry of activeTimers) {
+    if (!entry.message_ts || !entry.message_channel) continue;
+
+    const start = new Date(entry.start_time);
+    const minutes = Math.floor((now - start) / 60000);
+
+    // Update message in Slack
+    await app.client.chat.update({
+      channel: entry.message_channel,
+      ts: entry.message_ts,
+      text: `⏱ Timer running for <@${entry.user_id}>`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `⏱ <@${entry.user_id}> started a timer\n*Elapsed:* ${minutes} minute${minutes === 1 ? '' : 's'}`
+          }
+        }
+      ]
+    });
+  }
+}, 60_000); // every minute

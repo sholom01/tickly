@@ -1,0 +1,1 @@
+-- Supabase DB schema placeholder
